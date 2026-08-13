@@ -127,23 +127,34 @@ class CrossEncoderReranker:
         Returns:
             List of unique parent chunk payloads, ordered by their highest-scoring child.
         """
-        expanded = []
-        seen_parents = set()
+        parent_ids = []
+        child_score_map = {}
 
         for child in reranked_children:
             parent_id = child.get("parent_id")
-            if not parent_id or parent_id in seen_parents:
+            if not parent_id or parent_id in child_score_map:
                 continue
-
-            # Fetch parent payload from Qdrant
-            parent_payload = qdrant_indexer.get_point_by_chunk_id(parent_id)
-            if parent_payload:
-                # Inherit the child's high score for observability/guardrails
-                parent_payload["_inherited_score"] = child.get("_rerank_score", 0.0)
-                expanded.append(parent_payload)
-                seen_parents.add(parent_id)
-
-            if len(expanded) >= top_k:
+                
+            parent_ids.append(parent_id)
+            child_score_map[parent_id] = child.get("_rerank_score", 0.0)
+            
+            if len(parent_ids) >= top_k:
                 break
+
+        if not parent_ids:
+            return []
+
+        # Issue 4: Batch network request instead of serial round-trips
+        parent_payloads = qdrant_indexer.get_points_by_chunk_ids(parent_ids)
+        
+        # Re-sort to match the highest-scoring child's original ranking
+        payload_map = {p.get("chunk_id"): p for p in parent_payloads if p.get("chunk_id")}
+        
+        expanded = []
+        for pid in parent_ids:
+            if pid in payload_map:
+                payload = payload_map[pid]
+                payload["_inherited_score"] = child_score_map[pid]
+                expanded.append(payload)
 
         return expanded

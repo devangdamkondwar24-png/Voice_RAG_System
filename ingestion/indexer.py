@@ -7,12 +7,11 @@ Design rationale:
 - Payload indexes on `language`, `chunk_type`, `is_selected` are created
   BEFORE data ingestion. Qdrant uses these to build HNSW graph edges that
   respect filter constraints — enabling sub-millisecond filtered ANN search.
-  Creating indexes AFTER ingestion requires an expensive full rebuild.
 - Named vectors: "dense" (1024-dim float32) + "sparse" (variable, uint32 indices).
   This enables Qdrant's prefetch API to run both retrievals server-side in one call.
 - Scalar quantization (INT8): reduces index RAM from ~4 GB to ~1 GB for 1M vectors
-  with <0.3% recall degradation. The HNSW graph is still stored in full precision
-  for navigation; only stored vectors are quantized.
+  with <0.3% recall degradation. The full precision vectors are stored on disk 
+  (on_disk=True) to actually realize the RAM savings, while quantized vectors stay in RAM.
 - Batch upsert (512 points/batch): avoids Qdrant gRPC message size limits
   while maximizing throughput.
 """
@@ -42,7 +41,7 @@ FIELD_CHUNK_ID = "chunk_id"
 
 def _build_qdrant_point(
     chunk,
-    dense_vec: np.ndarray,
+    dense_vec: Optional[np.ndarray],
     sparse_vec: Optional[Dict],
 ) -> dict:
     """
@@ -52,15 +51,21 @@ def _build_qdrant_point(
     """
     from qdrant_client.models import PointStruct, SparseVector  # type: ignore
 
-    # Deterministic UUID from chunk_id string
-    point_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, chunk.chunk_id))
+    # Issue 7: Use NAMESPACE_OID instead of NAMESPACE_DNS
+    point_id = str(uuid.uuid5(uuid.NAMESPACE_OID, chunk.chunk_id))
 
-    vectors: dict = {DENSE_VECTOR_NAME: dense_vec.tolist()}
+    vectors: dict = {}
 
-    if sparse_vec:
-        indices = list(sparse_vec.keys())
-        values = [float(sparse_vec[i]) for i in indices]
-        vectors[SPARSE_VECTOR_NAME] = SparseVector(indices=indices, values=values)
+    # Issue 3: Parent chunks are for payload lookup only, don't index them in HNSW
+    if chunk.chunk_type != "parent":
+        if dense_vec is not None:
+            vectors[DENSE_VECTOR_NAME] = dense_vec.tolist()
+
+        if sparse_vec:
+            # Issue 1: Cast keys to int explicitly
+            indices = [int(k) for k in sparse_vec.keys()]
+            values = [float(sparse_vec[k]) for k in sparse_vec.keys()]
+            vectors[SPARSE_VECTOR_NAME] = SparseVector(indices=indices, values=values)
 
     return PointStruct(
         id=point_id,
@@ -163,7 +168,10 @@ class QdrantIndexer:
         )
 
         quantization_config = None
+        # Issue 2: Actually realize RAM savings by offloading full-precision vectors to disk
+        vectors_on_disk = False
         if self.use_scalar_quantization:
+            vectors_on_disk = True
             quantization_config = ScalarQuantization(
                 scalar=ScalarQuantizationConfig(
                     type=ScalarType.INT8,
@@ -181,7 +189,7 @@ class QdrantIndexer:
                     distance=Distance.COSINE,
                     hnsw_config=hnsw_config,
                     quantization_config=quantization_config,
-                    on_disk=False,
+                    on_disk=vectors_on_disk,
                 ),
             },
             sparse_vectors_config={
@@ -220,6 +228,7 @@ class QdrantIndexer:
         dense_vecs: np.ndarray,
         sparse_vecs: List[Optional[Dict]],
         batch_size: Optional[int] = None,
+        wait: bool = False,
     ) -> int:
         """
         Upsert embedded chunks into Qdrant in batches.
@@ -229,12 +238,11 @@ class QdrantIndexer:
             dense_vecs:  np.ndarray of shape (N, 1024)
             sparse_vecs: List of N sparse dicts (or None entries)
             batch_size:  Override default batch size
+            wait:        If True, wait for changes to actually be indexed
 
         Returns:
             Number of successfully upserted points.
         """
-        from qdrant_client.models import Batch  # type: ignore
-
         client = self._get_client()
         bs = batch_size or self.upsert_batch_size
         n = len(chunks)
@@ -243,19 +251,20 @@ class QdrantIndexer:
         for start in range(0, n, bs):
             end = min(start + bs, n)
             batch_chunks = chunks[start:end]
-            batch_dense = dense_vecs[start:end]
-            batch_sparse = sparse_vecs[start:end]
-
-            points = [
-                _build_qdrant_point(chunk, batch_dense[i], batch_sparse[i])
-                for i, chunk in enumerate(batch_chunks)
-            ]
+            
+            # Note: We safely allow dense_vecs / sparse_vecs to be empty lists
+            # or None if the caller is only upserting payload-only parent chunks.
+            points = []
+            for i, chunk in enumerate(batch_chunks):
+                d_vec = dense_vecs[start + i] if dense_vecs is not None and len(dense_vecs) > start + i else None
+                s_vec = sparse_vecs[start + i] if sparse_vecs is not None and len(sparse_vecs) > start + i else None
+                points.append(_build_qdrant_point(chunk, d_vec, s_vec))
 
             try:
                 client.upsert(
                     collection_name=self.collection_name,
                     points=points,
-                    wait=False,  # async write: faster, safe (WAL backed)
+                    wait=wait,  # async write: faster, safe (WAL backed). callers can force wait=True
                 )
                 total_upserted += len(points)
                 logger.debug(f"Upserted batch {start}–{end} ({len(points)} points)")
@@ -266,28 +275,29 @@ class QdrantIndexer:
         logger.info(f"Upserted {total_upserted}/{n} chunks into '{self.collection_name}'.")
         return total_upserted
 
-    def get_point_by_chunk_id(self, chunk_id: str) -> Optional[dict]:
+    def get_points_by_chunk_ids(self, chunk_ids: List[str]) -> List[dict]:
         """
-        Retrieve a stored point's payload by chunk_id string.
-        Used for parent-chunk context expansion after retrieval.
+        Retrieve stored points' payloads by a list of chunk_id strings.
+        Used for batched parent-chunk context expansion after retrieval.
         """
         import uuid as _uuid  # type: ignore
 
         client = self._get_client()
-        point_id = str(_uuid.uuid5(_uuid.NAMESPACE_DNS, chunk_id))
+        
+        # Issue 4: Batched retrieval for context expansion
+        point_ids = [str(_uuid.uuid5(_uuid.NAMESPACE_OID, cid)) for cid in chunk_ids]
 
         try:
             results = client.retrieve(
                 collection_name=self.collection_name,
-                ids=[point_id],
+                ids=point_ids,
                 with_payload=True,
                 with_vectors=False,
             )
-            if results:
-                return results[0].payload
+            return [res.payload for res in results if res.payload]
         except Exception as exc:
-            logger.warning(f"Failed to retrieve chunk_id='{chunk_id}': {exc}")
-        return None
+            logger.warning(f"Failed to retrieve chunk_ids={chunk_ids}: {exc}")
+        return []
 
     def collection_info(self) -> dict:
         """Return collection stats (vector count, status, etc.)."""
