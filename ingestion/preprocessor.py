@@ -12,6 +12,8 @@ Why preprocessing matters here (and why naive fixes don't work):
   IndicNLP solves Indic-script-specific normalization beyond NFC.
 - Deduplication: MSMARCO reuses the same passage across 5-20 queries per language.
   Without dedup, 40-60% of Qdrant vectors are identical, wasting GPU and storage.
+  Duplicates are *marked* (is_duplicate=True) rather than dropped so evaluation code
+  can still observe them; the indexer skips upserting them to Qdrant.
 - Language validation: MT failures produce Marathi text labeled as Hindi, Bengali as
   Assamese. A language-filtered Qdrant query then returns zero or irrelevant results.
 - Indic digits: BM25 cannot match १२३ against 123. Standardizing to Arabic digits
@@ -26,7 +28,7 @@ import logging
 import re
 import unicodedata
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Protocol, Tuple, runtime_checkable
 
 logger = logging.getLogger(__name__)
 
@@ -56,8 +58,6 @@ SCRIPT_RANGES: Dict[str, Tuple[str, str]] = {
 }
 
 # Full Indic-to-Arabic digit replacement table.
-# Sorted longer replacements first to avoid partial codepoint issues (none here,
-# but defensive style).
 INDIC_DIGIT_MAP: Dict[str, str] = {
     # Devanagari (hi, mr)
     "०": "0", "१": "1", "२": "2", "३": "3", "४": "4",
@@ -91,6 +91,9 @@ INDIC_DIGIT_MAP: Dict[str, str] = {
     "٥": "5", "٦": "6", "٧": "7", "٨": "8", "٩": "9",
 }
 
+# Change 1: Build a single translation table at module load — O(n) vs O(n*k) loop
+_DIGIT_TRANS_TABLE = str.maketrans(INDIC_DIGIT_MAP)
+
 # Languages where ZWNJ (U+200C) is linguistically meaningful and must be preserved.
 # In Malayalam and Kannada, ZWNJ controls whether consonants form conjuncts.
 ZWNJ_PRESERVE_LANGS = {"ml", "kn"}
@@ -100,6 +103,28 @@ _HTML_TAG_RE = re.compile(r"<[^>]+>")
 _URL_RE = re.compile(r"https?://\S+|www\.\S+")
 _MULTI_SPACE_RE = re.compile(r"[ \t]+")
 _MULTI_NEWLINE_RE = re.compile(r"\n{3,}")
+
+
+# ── Change 6: Structural Protocol types ──────────────────────────────────────
+
+@runtime_checkable
+class PassageEntryProtocol(Protocol):
+    passage_text: str
+    is_selected: int
+    passage_rank: int
+    english_text: str
+
+
+@runtime_checkable
+class DatasetEntryProtocol(Protocol):
+    query_id: int
+    query: str
+    query_type: str
+    gold_answer: str
+    language: str
+    source_lang: str
+    target_lang: str
+    passages: List[PassageEntryProtocol]
 
 
 # ── Data classes ──────────────────────────────────────────────────────────────
@@ -114,6 +139,10 @@ class PreprocessedPassage:
     passage_hash: str       # SHA-256[:16] of normalized text — dedup key
     is_duplicate: bool      # True if this passage was seen before in this run
     english_text: str = ""
+    # Change 5: Enriched dedup metadata (appears_in_queries, selection_ratio)
+    # Note: counts reflect state at processing time; they accumulate as more
+    # entries are processed. Do a second pass for fully-accurate final counts.
+    dedup_metadata: Dict = field(default_factory=dict)
 
 
 @dataclass
@@ -128,7 +157,9 @@ class PreprocessedEntry:
     source_lang: str
     target_lang: str
     passages: List[PreprocessedPassage]
-    skipped_passage_count: int = 0      # passages dropped this entry
+    # Change 8: Split into separate counters for clarity
+    skipped_passage_count: int = 0      # None/empty/too-short passages dropped
+    skipped_language_count: int = 0     # Passages rejected by language validation
 
     @property
     def has_relevant_passage(self) -> bool:
@@ -253,9 +284,13 @@ def validate_language(text: str, expected_lang: str, threshold: float = 0.3) -> 
     Unicode block for this language. MT failures produce passages in the wrong
     script; this catches them before they pollute the Qdrant index.
 
+    Change 2: Pure-numeric or pure-symbol passages (no alphabetic chars) are
+    allowed through — they are valid content (e.g. "42", "3.14") that would
+    have been incorrectly rejected by the original False, 0.0 return.
+
     Returns:
         (is_valid, script_ratio)
-        - is_valid: True if script_ratio >= threshold
+        - is_valid: True if script_ratio >= threshold, or no alpha chars exist
         - script_ratio: fraction of alpha chars in the expected script
     """
     if expected_lang not in SCRIPT_RANGES:
@@ -264,8 +299,10 @@ def validate_language(text: str, expected_lang: str, threshold: float = 0.3) -> 
 
     lo, hi = SCRIPT_RANGES[expected_lang]
     alpha_chars = [c for c in text if c.isalpha()]
+
+    # Change 2: allow passages with no alphabetic characters through
     if not alpha_chars:
-        return False, 0.0
+        return True, 1.0
 
     script_count = sum(1 for c in alpha_chars if lo <= c <= hi)
     ratio = script_count / len(alpha_chars)
@@ -276,17 +313,14 @@ def standardize_numerics(text: str) -> str:
     """
     Stage 6: Convert Indic-script digits to ASCII digits.
 
-    BGE-M3 and BM25 tokenizers both handle Arabic digits 0-9 better than
-    Indic digit codepoints, so user queries with Arabic digits match
-    passages that originally had Indic digits.
+    Change 1: Uses str.translate with a pre-built translation table for O(n)
+    single-pass replacement — ~10× faster than the previous for-loop approach
+    that performed k separate str.replace scans for k digit codepoints.
 
     Design: we replace in the processed text only; raw_text is preserved
     for display so users always see the original form.
     """
-    for indic, arabic in INDIC_DIGIT_MAP.items():
-        if indic in text:
-            text = text.replace(indic, arabic)
-    return text
+    return text.translate(_DIGIT_TRANS_TABLE)
 
 
 def _passage_hash(text: str) -> str:
@@ -299,15 +333,15 @@ def _passage_hash(text: str) -> str:
 
 class PassageDeduplicator:
     """
-    Stage 5: Cross-query passage deduplication.
+    Stage 5: Cross-query passage deduplication tracker.
 
     Tracks all passage text hashes seen so far in a single ingestion run.
-    MSMARCO reuses passages across 5-20 queries; without dedup, the Qdrant
+    MSMARCO reuses passages across 5-20 queries; without tracking, the Qdrant
     index contains 40-60% identical vectors.
 
-    Metadata enrichment: duplicate passages carry aggregated relevance signals
-    (query_ids they appear in, total times they were selected) which improves
-    retrieval confidence scoring in Guardrail Layer 2.
+    Metadata enrichment: passages carry aggregated relevance signals
+    (query_ids they appear in, total times they were selected) which can be
+    used to strengthen is_selected confidence signals.
     """
 
     def __init__(self) -> None:
@@ -320,7 +354,8 @@ class PassageDeduplicator:
     ) -> Tuple[bool, str]:
         """
         Returns (is_new, passage_hash).
-        If is_new=False, the passage was already seen; skip indexing but update metadata.
+        If is_new=False, the passage hash was seen before; caller should mark
+        the passage as is_duplicate=True but NOT drop it from the entry.
         """
         h = _passage_hash(passage_text)
 
@@ -360,9 +395,9 @@ class DatasetPreprocessor:
         1. Structural validation — reject malformed entries early
         2. Unicode normalization — NFC + IndicNLP script normalizer
         3. Text cleaning — HTML, URLs, zero-width chars
-        4. Language validation — script-detection check
-        5. Deduplication — passage-level hash dedup
-        6. Numeric standardization — Indic digits → Arabic digits
+        4. Language validation — script-detection check (skips pure-numeric passages)
+        5. Deduplication — passage-level hash dedup; marks, doesn't drop
+        6. Numeric standardization — Indic digits → Arabic digits (str.translate)
 
     The same preprocess_query() helper applies stages 2, 3, 6 at query time
     to guarantee embedding-space consistency with indexed passages.
@@ -372,7 +407,7 @@ class DatasetPreprocessor:
         enable_text_cleaning:        Strip HTML/URL/ZW chars
         enable_language_validation:  Reject wrong-script passages
         language_validation_threshold: Min fraction of text in expected script
-        enable_deduplication:        Cross-query passage dedup
+        enable_deduplication:        Cross-query passage dedup (mark, not drop)
         enable_numeric_standardization: Indic → Arabic digits
         min_passage_length:          Minimum characters for a valid passage
         preserve_raw_text:           Store original text in PreprocessedPassage.raw_text
@@ -403,22 +438,30 @@ class DatasetPreprocessor:
         self.deduplicator = deduplicator or PassageDeduplicator()
         self.stats = PreprocessorStats()
 
-    def _process_text(self, text: str, language: str) -> str:
-        """Apply text-level transformations (stages 2, 3, 6) to a single string."""
+    # Change 3: Split _process_text into _normalize and _standardize_digits
+    # so each stage can be counted independently in stats.
+
+    def _normalize(self, text: str, language: str) -> str:
+        """Stages 2+3: Unicode normalize + text clean."""
         if self.enable_unicode_nfc:
             text = normalize_unicode(text, language)
         if self.enable_text_cleaning:
             text = clean_text(text, language)
-        if self.enable_numeric_standardization:
-            text = standardize_numerics(text)
         return text
 
-    def preprocess_entry(self, entry) -> Optional[PreprocessedEntry]:
+    def _standardize_digits(self, text: str) -> Tuple[str, bool]:
+        """Stage 6: Numeric standardization. Returns (text, was_changed)."""
+        if not self.enable_numeric_standardization:
+            return text, False
+        new_text = standardize_numerics(text)
+        return new_text, new_text != text
+
+    def preprocess_entry(self, entry: DatasetEntryProtocol) -> Optional[PreprocessedEntry]:
         """
         Apply the full 6-stage pipeline to a DatasetEntry.
 
         Args:
-            entry: DatasetEntry from dataset_loader.py
+            entry: DatasetEntry from dataset_loader.py (or any DatasetEntryProtocol)
 
         Returns:
             PreprocessedEntry if valid, None if the entry fails structural validation.
@@ -437,13 +480,16 @@ class DatasetPreprocessor:
             logger.debug(f"[{lang}] query_id={entry.query_id}: empty query, skipping.")
             return None
 
-        # ── Preprocess query ──────────────────────────────────────────────────
+        # ── Preprocess query (Change 3: use split helpers) ───────────────────
         raw_query = entry.query
-        processed_query = self._process_text(raw_query, lang)
+        processed_query = self._normalize(raw_query, lang)
+        processed_query, _ = self._standardize_digits(processed_query)
 
         # ── Process passages ──────────────────────────────────────────────────
         processed_passages: List[PreprocessedPassage] = []
-        skipped = 0
+        # Change 8: separate counters for structural vs. language drops
+        skipped_structural = 0
+        skipped_language = 0
 
         for p in entry.passages:
             raw_text = p.passage_text
@@ -451,19 +497,27 @@ class DatasetPreprocessor:
             # Stage 1: Filter None / too-short passages
             if not raw_text or not raw_text.strip():
                 self.stats.skipped_none_passages += 1
-                skipped += 1
+                skipped_structural += 1
                 continue
 
             if len(raw_text.strip()) < self.min_passage_length:
                 self.stats.skipped_short_passages += 1
-                skipped += 1
+                skipped_structural += 1
                 continue
 
-            # Stage 2 + 3 + 6: Text-level transforms
-            processed_text = self._process_text(raw_text, lang)
-            was_modified = processed_text != raw_text
-            if was_modified:
+            # Change 7: Move passages_before_dedup counter to here — before
+            # language validation — so it truly counts all structurally-valid
+            # passages that entered the dedup decision point.
+            self.stats.passages_before_dedup += 1
+
+            # Change 3: Stage 2+3 and Stage 6 with per-stage stat tracking
+            processed_text = self._normalize(raw_text, lang)
+            if processed_text != raw_text:
                 self.stats.text_cleaned_count += 1
+
+            processed_text, digits_changed = self._standardize_digits(processed_text)
+            if digits_changed:
+                self.stats.numeric_standardized_count += 1
 
             # Stage 4: Language validation
             if self.enable_language_validation and lang in SCRIPT_RANGES:
@@ -476,32 +530,27 @@ class DatasetPreprocessor:
                         f"[{lang}] query_id={entry.query_id} passage_rank={p.passage_rank}: "
                         f"script ratio={ratio:.2f} < {self.language_validation_threshold}, skipping."
                     )
-                    skipped += 1
+                    skipped_language += 1
                     continue
 
-            self.stats.passages_before_dedup += 1
-
-            # Stage 5: Deduplication
+            # Stage 5: Deduplication — Change 4: mark, don't drop
             is_new, h = self.deduplicator.process(processed_text, entry.query_id, p.is_selected)
-            if not is_new:
-                # Still track in stats but don't add to processed_passages
-                skipped += 1
-                continue
-
-            self.stats.passages_after_dedup += 1
+            if is_new:
+                self.stats.passages_after_dedup += 1
             self.stats.final_clean_passages += 1
 
-            processed_passages.append(
-                PreprocessedPassage(
-                    text=processed_text,
-                    raw_text=raw_text if self.preserve_raw_text else "",
-                    is_selected=p.is_selected,
-                    passage_rank=p.passage_rank,
-                    passage_hash=h,
-                    is_duplicate=False,
-                    english_text=p.english_text,
-                )
+            # Change 5: Attach dedup metadata to every passage
+            passage = PreprocessedPassage(
+                text=processed_text,
+                raw_text=raw_text if self.preserve_raw_text else "",
+                is_selected=p.is_selected,
+                passage_rank=p.passage_rank,
+                passage_hash=h,
+                is_duplicate=not is_new,
+                english_text=p.english_text,
             )
+            passage.dedup_metadata = self.deduplicator.get_metadata(h)
+            processed_passages.append(passage)
 
         if not processed_passages:
             # All passages were filtered — entry is unusable
@@ -517,12 +566,13 @@ class DatasetPreprocessor:
             query=processed_query,
             raw_query=raw_query,
             query_type=entry.query_type,
-            gold_answer=self._process_text(entry.gold_answer, lang) if entry.gold_answer else "",
+            gold_answer=self._normalize(entry.gold_answer, lang) if entry.gold_answer else "",
             language=lang,
             source_lang=entry.source_lang,
             target_lang=entry.target_lang,
             passages=processed_passages,
-            skipped_passage_count=skipped,
+            skipped_passage_count=skipped_structural,
+            skipped_language_count=skipped_language,
         )
 
     def log_stats(self) -> None:

@@ -142,7 +142,7 @@ def test_dedup_new_passage():
 
 
 def test_dedup_duplicate():
-    """Second occurrence of the same passage must be marked as duplicate."""
+    """Second occurrence of the same passage must be marked is_duplicate=True (not dropped)."""
     dedup = PassageDeduplicator()
     dedup.process("duplicate passage text", query_id=1, is_selected=0)
     is_new, _ = dedup.process("duplicate passage text", query_id=2, is_selected=1)
@@ -270,6 +270,62 @@ def test_full_pipeline():
     assert "&amp;" not in p.text
     assert "2024" in p.text
     assert "२" not in p.text
+    assert not p.is_duplicate
+    assert isinstance(p.dedup_metadata, dict)
+    assert "passage_hash" in p.dedup_metadata
+
+
+def test_duplicate_passage_marked_not_dropped():
+    """A passage seen in a prior query must be marked is_duplicate=True in the entry."""
+    preprocessor = DatasetPreprocessor(enable_deduplication=True)
+
+    shared_text = "यह एक साझा हिंदी पैसेज है जो दो प्रश्नों में आता है।"
+    p = SimpleNamespace(
+        passage_text=shared_text, english_text="", is_selected=1, passage_rank=0
+    )
+
+    entry1 = _make_entry([p], "hi", query="first query")
+    entry1.query_id = 1
+    result1 = preprocessor.preprocess_entry(entry1)
+    assert result1 is not None
+    assert not result1.passages[0].is_duplicate
+
+    entry2 = _make_entry([p], "hi", query="second query")
+    entry2.query_id = 2
+    result2 = preprocessor.preprocess_entry(entry2)
+    assert result2 is not None
+    # Passage still present in the entry, but flagged as duplicate
+    assert len(result2.passages) == 1
+    assert result2.passages[0].is_duplicate
+
+
+def test_skipped_language_count_tracked():
+    """Wrong-language passages must increment skipped_language_count on the entry."""
+    preprocessor = DatasetPreprocessor(enable_language_validation=True)
+
+    # Tamil passage labeled as Hindi — should fail language validation
+    bad_passage = SimpleNamespace(
+        passage_text="இது தமிழில் எழுதப்பட்ட ஒரு வாக்கியம்.",
+        english_text="", is_selected=0, passage_rank=0,
+    )
+    good_passage = SimpleNamespace(
+        passage_text="यह एक सामान्य हिंदी वाक्य है जो परीक्षण के लिए लिखा गया है।",
+        english_text="", is_selected=1, passage_rank=1,
+    )
+    entry = _make_entry([bad_passage, good_passage], "hi")
+    result = preprocessor.preprocess_entry(entry)
+
+    assert result is not None
+    assert result.skipped_language_count == 1
+    assert result.skipped_passage_count == 0
+    assert len(result.passages) == 1
+
+
+def test_pure_numeric_passage_passes_language_validation():
+    """Passages with no alphabetic chars (e.g. '42') must pass language validation."""
+    is_valid, ratio = validate_language("42 3.14 100%", "hi", threshold=0.3)
+    assert is_valid, "Pure-numeric passage must pass language validation"
+    assert ratio == 1.0
 
 
 # ── Query-time preprocessing consistency ─────────────────────────────────────

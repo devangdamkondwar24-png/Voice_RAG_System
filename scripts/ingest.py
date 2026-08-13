@@ -197,7 +197,9 @@ def _chunk_preprocessed_entry(entry, chunker: HierarchicalChunker):
     """
     from types import SimpleNamespace
 
-    # Rebuild a minimal DatasetEntry-like object from the preprocessed entry
+    # Only forward non-duplicate passages to the chunker.
+    # Duplicates are kept in PreprocessedEntry for evaluation purposes but
+    # must not be embedded or indexed into Qdrant.
     passages = [
         SimpleNamespace(
             passage_text=p.text,
@@ -206,7 +208,10 @@ def _chunk_preprocessed_entry(entry, chunker: HierarchicalChunker):
             passage_rank=p.passage_rank,
         )
         for p in entry.passages
+        if not p.is_duplicate
     ]
+    if not passages:
+        return [], []
     adapter = SimpleNamespace(
         query_id=entry.query_id,
         language=entry.language,
