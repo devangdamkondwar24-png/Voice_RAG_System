@@ -144,6 +144,31 @@ class GuardrailSettings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
 
+class PreprocessingSettings(BaseSettings):
+    """Controls for the 6-stage preprocessing pipeline in preprocessor.py."""
+
+    enable_unicode_nfc: bool = True
+    enable_indicnlp_normalize: bool = True
+    enable_text_cleaning: bool = True
+    enable_language_validation: bool = True
+    # Min fraction of text that must be in the expected script to pass
+    language_validation_threshold: float = Field(
+        default=0.3, alias="LANG_VALIDATION_THRESHOLD"
+    )
+    enable_deduplication: bool = True
+    enable_numeric_standardization: bool = True
+    # Passages shorter than this are discarded (likely truncated MT output)
+    min_passage_length: int = Field(default=10, alias="MIN_PASSAGE_LENGTH")
+    # Preserve original pre-normalization text in PassageEntry.raw_text for display
+    preserve_raw_text: bool = True
+    supported_languages: List[str] = [
+        "hi", "ta", "te", "bn", "mr", "gu",
+        "kn", "ml", "pa", "or", "as", "ur",
+    ]
+
+    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+
+
 class ChunkingSettings(BaseSettings):
     """Hierarchical parent-child chunking configuration."""
 
@@ -219,7 +244,7 @@ class Settings(BaseSettings):
     Usage:
         from config.settings import get_settings
         cfg = get_settings()
-        print(cfg.qdrant.url)
+        print(cfg.preprocessing.enable_deduplication)
     """
 
     sarvam: SarvamSettings = SarvamSettings()
@@ -229,6 +254,7 @@ class Settings(BaseSettings):
     llm: LLMSettings = LLMSettings()
     guardrails: GuardrailSettings = GuardrailSettings()
     chunking: ChunkingSettings = ChunkingSettings()
+    preprocessing: PreprocessingSettings = PreprocessingSettings()
     ingestion: IngestionSettings = IngestionSettings()
     api: APISettings = APISettings()
 

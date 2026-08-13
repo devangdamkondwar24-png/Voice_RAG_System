@@ -29,6 +29,7 @@ from retrieval.reranker import CrossEncoderReranker
 from generation.prompts import build_rag_prompt
 from generation.llm_client import LLMClient
 from ingestion.indexer import QdrantIndexer
+from ingestion.preprocessor import preprocess_query
 
 logger = logging.getLogger(__name__)
 
@@ -262,9 +263,13 @@ class RAGOrchestrator:
 
     async def run(self, request_id: str, query: str, language: str) -> Dict[str, Any]:
         """Execute the workflow for a single query."""
+        # Apply the same normalization applied at ingest time to guarantee the
+        # query embedding lands in the same vector-space region as indexed passages.
+        normalized_query = preprocess_query(query, language)
+
         initial_state: RAGState = {
             "request_id": request_id,
-            "query": query,
+            "query": normalized_query,
             "language": language,
             
             # Defaults

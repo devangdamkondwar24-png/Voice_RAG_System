@@ -3,8 +3,12 @@ scripts/ingest.py
 ─────────────────
 CLI script to ingest MSMARCO-XI dataset into Qdrant.
 
-Executes the pipeline:
-  HuggingFace dataset stream → HierarchicalChunker → BGEM3Embedder → QdrantIndexer
+Full pipeline:
+  HuggingFace dataset stream
+  → DatasetPreprocessor (Unicode / dedup / lang-validation / digit-standardize)
+  → HierarchicalChunker
+  → BGEM3Embedder
+  → QdrantIndexer
 """
 
 from __future__ import annotations
@@ -30,6 +34,7 @@ from ingestion.chunking import HierarchicalChunker
 from ingestion.dataset_loader import load_language_dataset
 from ingestion.embedder import BGEM3Embedder
 from ingestion.indexer import QdrantIndexer
+from ingestion.preprocessor import DatasetPreprocessor, PassageDeduplicator
 
 logging.basicConfig(
     level=logging.INFO,
@@ -54,8 +59,11 @@ def run(
     recreate: bool = typer.Option(
         False, "--recreate", help="Drop and recreate existing Qdrant collection."
     ),
+    skip_dedup: bool = typer.Option(
+        False, "--skip-dedup", help="Disable cross-query deduplication (faster, larger index)."
+    ),
 ):
-    """Run the ingestion pipeline."""
+    """Run the ingestion pipeline with preprocessing."""
     settings = get_settings()
 
     target_langs = (
@@ -66,8 +74,9 @@ def run(
     target_limit = limit if limit > 0 else settings.ingestion.ingest_limit
 
     console.print("[bold blue]Starting MSMARCO-XI Ingestion Pipeline[/bold blue]")
-    console.print(f"Languages: {target_langs}")
-    console.print(f"Limit per language: {target_limit or 'All'}")
+    console.print(f"Languages:           {target_langs}")
+    console.print(f"Limit per language:  {target_limit or 'All'}")
+    console.print(f"Deduplication:       {'OFF' if skip_dedup else 'ON'}")
 
     # ── Initialize Components ───────────────────────────────────────────────
     with console.status("Initializing embedder and Qdrant indexer..."):
@@ -100,7 +109,23 @@ def run(
 
         indexer.setup_collection(recreate=recreate)
 
-    # ── Processing Loop ───────────────────────────────────────────────────
+    # ── Shared deduplicator (spans all languages so cross-lang dupes are caught too)
+    pp_cfg = settings.preprocessing
+    deduplicator = PassageDeduplicator()
+
+    preprocessor = DatasetPreprocessor(
+        enable_unicode_nfc=pp_cfg.enable_unicode_nfc,
+        enable_text_cleaning=pp_cfg.enable_text_cleaning,
+        enable_language_validation=pp_cfg.enable_language_validation,
+        language_validation_threshold=pp_cfg.language_validation_threshold,
+        enable_deduplication=(not skip_dedup) and pp_cfg.enable_deduplication,
+        enable_numeric_standardization=pp_cfg.enable_numeric_standardization,
+        min_passage_length=pp_cfg.min_passage_length,
+        preserve_raw_text=pp_cfg.preserve_raw_text,
+        deduplicator=deduplicator,
+    )
+
+    # ── Processing Loop ────────────────────────────────────────────────────
     total_chunks = 0
     start_time = time.time()
 
@@ -114,9 +139,8 @@ def run(
             limit=target_limit,
         )
 
-        # We accumulate chunks to batch embed and index
         batch_chunks = []
-        flush_size = settings.embedding.batch_size * 10  # process ~640 chunks at a time
+        flush_size = settings.embedding.batch_size * 10  # ~640 chunks per flush
 
         with Progress(
             SpinnerColumn(),
@@ -126,15 +150,20 @@ def run(
             TimeElapsedColumn(),
             console=console,
         ) as progress:
-            
-            # Note: We can't know total queries upfront with streaming datasets
+
             task = progress.add_task(f"Ingesting {lang}...", total=None)
             queries_processed = 0
 
-            for entry in ds_stream:
-                parents, children = chunker.chunk_entry(entry)
-                # We index BOTH parents and children.
-                # Parents are stored but not retrieved (query_type="parent").
+            for raw_entry in ds_stream:
+                # ── Preprocessing stage ──────────────────────────────────
+                entry = preprocessor.preprocess_entry(raw_entry)
+                if entry is None:
+                    continue  # Structural failure — skip whole entry
+
+                # ── Chunking stage ───────────────────────────────────────
+                # Build a lightweight adapter so HierarchicalChunker is satisfied
+                # (it expects .passages with .passage_text / .is_selected / .passage_rank)
+                parents, children = _chunk_preprocessed_entry(entry, chunker)
                 batch_chunks.extend(parents)
                 batch_chunks.extend(children)
                 queries_processed += 1
@@ -148,7 +177,7 @@ def run(
 
             # Flush remaining
             if batch_chunks:
-                _flush_batch(batch_chunks, embedder, indexer)
+                _flush_batch(batch_chunks, embedder, indexer, wait_final=True)
                 total_chunks += len(batch_chunks)
                 progress.update(task, advance=queries_processed)
 
@@ -156,18 +185,65 @@ def run(
     console.print("\n[bold blue]Ingestion Complete![/bold blue]")
     console.print(f"Total chunks indexed: {total_chunks}")
     console.print(f"Time elapsed: {elapsed:.2f} seconds")
+    # Print full preprocessing statistics
+    preprocessor.log_stats()
 
 
-def _flush_batch(chunks: List, embedder: BGEM3Embedder, indexer: QdrantIndexer) -> None:
+def _chunk_preprocessed_entry(entry, chunker: HierarchicalChunker):
+    """
+    Adapter that converts a PreprocessedEntry into a chunker-compatible object
+    and calls chunk_entry().  We use a simple namespace-style object to avoid
+    creating a hard dependency between preprocessor.py and chunking.py.
+    """
+    from types import SimpleNamespace
+
+    # Rebuild a minimal DatasetEntry-like object from the preprocessed entry
+    passages = [
+        SimpleNamespace(
+            passage_text=p.text,
+            english_text=p.english_text,
+            is_selected=p.is_selected,
+            passage_rank=p.passage_rank,
+        )
+        for p in entry.passages
+    ]
+    adapter = SimpleNamespace(
+        query_id=entry.query_id,
+        language=entry.language,
+        query_type=entry.query_type,
+        passages=passages,
+    )
+    return chunker.chunk_entry(adapter)
+
+
+def _flush_batch(
+    chunks: List,
+    embedder: BGEM3Embedder,
+    indexer: QdrantIndexer,
+    wait_final: bool = False,
+) -> None:
     """Helper to embed and upsert a batch of chunks."""
     if not chunks:
         return
 
-    texts = [chunk.text for chunk in chunks]
-    # Embed (returns dense array and list of sparse dicts)
-    dense_vecs, sparse_vecs = embedder.embed_chunks_batch(texts, show_progress=False)
-    # Upsert to Qdrant
-    indexer.upsert_chunks(chunks, dense_vecs, sparse_vecs)
+    # Only embed child chunks; parent chunks don't need vectors (payload-only)
+    child_chunks = [c for c in chunks if c.chunk_type == "child"]
+    parent_chunks = [c for c in chunks if c.chunk_type == "parent"]
+
+    if child_chunks:
+        texts = [c.text for c in child_chunks]
+        dense_vecs, sparse_vecs = embedder.embed_chunks_batch(texts, show_progress=False)
+        indexer.upsert_chunks(child_chunks, dense_vecs, sparse_vecs, wait=wait_final)
+
+    if parent_chunks:
+        import numpy as np
+        # Upsert parents as payload-only (empty vectors)
+        indexer.upsert_chunks(
+            parent_chunks,
+            np.empty((0, 1024), dtype=np.float32),
+            [],
+            wait=wait_final,
+        )
 
 
 if __name__ == "__main__":
