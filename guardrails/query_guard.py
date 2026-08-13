@@ -6,15 +6,15 @@ Layer 1 Guardrails: Topic Classification and Safety Filtering.
 Design rationale:
 - Reject off-topic queries immediately (saves ~150ms of retrieval/generation).
 - MSMARCO-XI defines query types: ENTITY, DESCRIPTION, PROCEDURE, NUMERIC, LOCATION, PERSON.
-  We use zero-shot classification via `facebook/bart-large-mnli` to enforce this.
-- Reject toxic queries using `unitary/toxic-bert`.
-- Indic language support: To avoid loading 12 different toxicity models, we use
-  zero-shot cross-lingual transfer (BART/mDeBERTa) or transliteration if needed,
-  though modern multilingual MNLI models handle Indic scripts reasonably well.
+  We use zero-shot classification via `MoritzLaurer/mDeBERTa-v3-base-mnli-xnli` (multilingual) 
+  to enforce this across all 12 Indic languages.
+- Reject toxic queries using `Hate-speech-CNERG/indic-abusive-allInOne-roberta-cross-project`.
+- Both checks are run concurrently via ThreadPoolExecutor to minimize the critical path latency.
 """
 
 from __future__ import annotations
 
+import concurrent.futures
 import logging
 from typing import Dict, List, Optional, Tuple
 
@@ -26,8 +26,8 @@ class QueryGuard:
     Evaluates queries for domain relevance (topic) and safety (toxicity).
 
     Args:
-        topic_model_name: Zero-shot classification model
-        safety_model_name: Toxicity detection model
+        topic_model_name: Zero-shot classification model (multilingual preferred)
+        safety_model_name: Toxicity detection model (multilingual preferred)
         valid_topics: List of allowed topic strings
         topic_threshold: Minimum probability for a topic match
         toxicity_threshold: Maximum allowed toxicity probability
@@ -36,8 +36,8 @@ class QueryGuard:
 
     def __init__(
         self,
-        topic_model_name: str = "facebook/bart-large-mnli",
-        safety_model_name: str = "unitary/toxic-bert",
+        topic_model_name: str = "MoritzLaurer/mDeBERTa-v3-base-mnli-xnli",
+        safety_model_name: str = "Hate-speech-CNERG/indic-abusive-allInOne-roberta-cross-project",
         valid_topics: Optional[List[str]] = None,
         topic_threshold: float = 0.3,
         toxicity_threshold: float = 0.7,
@@ -99,7 +99,7 @@ class QueryGuard:
             multi_label=False,
         )
 
-        top_topic = result["labels"][0]
+        top_topic = result["labels"][0].upper()  # Enforce taxonomy casing (e.g. ENTITY)
         top_score = result["scores"][0]
 
         is_valid = top_score >= self.topic_threshold
@@ -114,7 +114,7 @@ class QueryGuard:
         """
         self._load_safety_model()
 
-        # toxic-bert usually outputs 'toxic' or 'clean' labels
+        # pipeline usually outputs lists of dicts
         result = self._safety_pipeline(query, top_k=None)
         
         # Flatten pipeline output format
@@ -124,7 +124,8 @@ class QueryGuard:
         toxicity_score = 0.0
         for label_dict in result:
             label = label_dict["label"].lower()
-            if label in ["toxic", "severe_toxic", "obscene", "threat", "insult", "identity_hate"]:
+            # Catch labels from toxic-bert as well as indic-abusive models
+            if label in ["toxic", "severe_toxic", "obscene", "threat", "insult", "identity_hate", "abusive", "hate"]:
                 toxicity_score = max(toxicity_score, label_dict["score"])
 
         is_safe = toxicity_score < self.toxicity_threshold
@@ -132,32 +133,34 @@ class QueryGuard:
 
     def validate_query(self, query: str) -> Dict[str, any]:
         """
-        Run both topic and safety checks.
+        Run both topic and safety checks concurrently via thread pool.
         
         Returns dict with results and combined pass/fail status.
         """
-        is_safe, tox_score = self.check_safety(query)
+        # Pre-load to prevent thread racing on initialization
+        self._load_safety_model()
+        self._load_topic_model()
         
-        # Fast-fail: don't check topic if query is toxic
-        if not is_safe:
-            return {
-                "passed": False,
-                "reason": "safety_violation",
-                "is_safe": False,
-                "toxicity_score": tox_score,
-                "is_on_topic": False,
-                "topic": "none",
-                "topic_score": 0.0,
-            }
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            future_safety = executor.submit(self.check_safety, query)
+            future_topic = executor.submit(self.check_topic, query)
             
-        is_on_topic, topic, topic_score = self.check_topic(query)
+            is_safe, tox_score = future_safety.result()
+            is_on_topic, topic, topic_score = future_topic.result()
         
+        # Determine failure reason
+        reason = None
+        if not is_safe:
+            reason = "safety_violation"
+        elif not is_on_topic:
+            reason = "off_topic"
+            
         return {
             "passed": is_safe and is_on_topic,
-            "reason": None if is_on_topic else "off_topic",
+            "reason": reason,
             "is_safe": is_safe,
             "toxicity_score": tox_score,
             "is_on_topic": is_on_topic,
-            "topic": topic,
-            "topic_score": topic_score,
+            "topic": topic if is_safe else "NONE",
+            "topic_score": topic_score if is_safe else 0.0,
         }
