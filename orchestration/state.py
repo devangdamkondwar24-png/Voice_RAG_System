@@ -42,6 +42,11 @@ class RAGState(TypedDict):
     generated_answer: str
     generation_grounded: bool
     grounding_score: float
+    citations: List[Dict]        # Track extracted/validated citations
+
+    # ── Observability ───────────────────────────────────
+    stage_latencies: Dict[str, float]  # ms taken per stage
+    total_latency_ms: float
     
     # ── Orchestration state ─────────────────────────────
     should_abstain: bool
