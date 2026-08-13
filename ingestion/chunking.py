@@ -55,7 +55,6 @@ LAYER 3 — Metadata Enrichment
 
 from __future__ import annotations
 
-import hashlib
 import logging
 import re
 from dataclasses import dataclass, field
@@ -255,28 +254,21 @@ class HierarchicalChunker:
     def _group_sentences_into_children(
         self,
         sentences: List[str],
+        embeddings: Optional[np.ndarray],
         language: str,
     ) -> List[str]:
         """
         Group sentences into child chunks using semantic similarity and token counts.
 
         Algorithm:
-        1. Compute sentence embeddings (if embedder available).
-        2. Walk sentences left-to-right, accumulating into current chunk.
-        3. Force split if:
-           a) Adding next sentence would exceed child_max_tokens, OR
-           b) Cosine similarity between current_sentence and next < semantic_threshold
-        4. Apply overlap: prepend last `overlap_sentences` from previous chunk.
-
-        Returns: list of child chunk texts (with overlap applied).
+        1. Group respecting child_max_tokens and semantic_threshold.
+        2. Merge chunks that fall below child_min_tokens.
+        3. Apply token-based overlap while strictly enforcing child_max_tokens.
         """
         if not sentences:
             return []
 
-        # ── Step 1: Compute embeddings for semantic splitting ──────────────
-        embeddings: Optional[np.ndarray] = self._embed_sentences(sentences)
-
-        # ── Step 2-3: Group into raw chunks ───────────────────────────────
+        # ── Step 1: Initial grouping respecting max_tokens and semantics ──
         raw_chunks: List[List[str]] = []
         current: List[str] = []
         current_tokens = 0
@@ -284,13 +276,10 @@ class HierarchicalChunker:
         for i, sent in enumerate(sentences):
             sent_tokens = _estimate_tokens(sent, language)
 
-            # Decide whether to start a new chunk
             should_split = False
-
             if current_tokens + sent_tokens > self.child_max_tokens and current:
                 should_split = True
-
-            if (
+            elif (
                 embeddings is not None
                 and not should_split
                 and current
@@ -299,13 +288,9 @@ class HierarchicalChunker:
                 sim = _cosine_similarity(embeddings[i - 1], embeddings[i])
                 if sim < self.semantic_threshold:
                     should_split = True
-                    logger.debug(
-                        f"Semantic split at sentence {i}: similarity={sim:.3f} < {self.semantic_threshold}"
-                    )
 
             if should_split:
-                if current:
-                    raw_chunks.append(current)
+                raw_chunks.append(current)
                 current = [sent]
                 current_tokens = sent_tokens
             else:
@@ -315,40 +300,69 @@ class HierarchicalChunker:
         if current:
             raw_chunks.append(current)
 
-        # ── Step 4: Apply overlap ──────────────────────────────────────────
-        # Determine how many sentences to carry over (≈12% of chunk tokens)
-        child_chunks: List[str] = []
-        for idx, chunk_sents in enumerate(raw_chunks):
-            if idx > 0 and len(raw_chunks[idx - 1]) >= 2:
-                # Overlap = last ceil(overlap_percent * len) sentences from prev chunk
-                prev = raw_chunks[idx - 1]
-                n_overlap = max(1, round(len(prev) * self.overlap_percent))
-                overlap_sents = prev[-n_overlap:]
-                chunk_sents = overlap_sents + chunk_sents
+        # ── Step 2: Merge undersized chunks (Issue 1) ──────────────────────
+        merged_chunks: List[List[str]] = []
+        for chunk in raw_chunks:
+            if not merged_chunks:
+                merged_chunks.append(chunk)
+                continue
+                
+            chunk_tokens = sum(_estimate_tokens(s, language) for s in chunk)
+            prev_tokens = sum(_estimate_tokens(s, language) for s in merged_chunks[-1])
+            
+            # Merge if either is undersized, provided we don't wildly exceed max_tokens
+            if (chunk_tokens < self.child_min_tokens or prev_tokens < self.child_min_tokens) and (chunk_tokens + prev_tokens <= self.child_max_tokens + 50):
+                merged_chunks[-1].extend(chunk)
+            else:
+                merged_chunks.append(chunk)
 
-            child_chunks.append(" ".join(chunk_sents).strip())
+        # ── Step 3 & 4: Apply overlap by tokens and enforce bounds (Issues 3,4,5)
+        child_texts: List[str] = []
+        for idx, chunk in enumerate(merged_chunks):
+            if idx == 0:
+                child_texts.append(" ".join(chunk).strip())
+                continue
+                
+            prev_chunk = merged_chunks[idx - 1]
+            prev_tokens = sum(_estimate_tokens(s, language) for s in prev_chunk)
+            target_overlap_tokens = max(1, int(prev_tokens * self.overlap_percent))
+            
+            chunk_tokens = sum(_estimate_tokens(s, language) for s in chunk)
+            available_room = self.child_max_tokens - chunk_tokens
+            
+            overlap_sents = []
+            if available_room > 0:
+                overlap_tokens = 0
+                for s in reversed(prev_chunk):
+                    s_toks = _estimate_tokens(s, language)
+                    if overlap_tokens + s_toks > target_overlap_tokens or overlap_tokens + s_toks > available_room:
+                        # Ensure we grab at least 1 sentence if there's room and we haven't grabbed any
+                        if not overlap_sents and s_toks <= available_room:
+                            overlap_sents.insert(0, s)
+                        break
+                    overlap_sents.insert(0, s)
+                    overlap_tokens += s_toks
+                    
+            combined = overlap_sents + chunk
+            child_texts.append(" ".join(combined).strip())
 
-        return child_chunks
+        return child_texts
 
-    def chunk_passage(
+    def _chunk_passage_with_sentences(
         self,
         passage_text: str,
+        sentences: List[str],
+        embeddings: Optional[np.ndarray],
         language: str,
         query_id: int,
         is_selected: int,
         passage_rank: int,
         query_type: str,
     ) -> Tuple[Chunk, List[Chunk]]:
-        """
-        Chunk a single passage into one parent + N child chunks.
-
-        Returns:
-            (parent_chunk, child_chunks) where child_chunks is a list of 1-4 children.
-        """
+        """Core logic to construct parent and children given pre-computed embeddings."""
         parent_id = _make_parent_id(language, query_id, passage_rank)
         parent_tokens = _estimate_tokens(passage_text, language)
 
-        # ── Parent chunk ───────────────────────────────────────────────────
         parent_chunk = Chunk(
             chunk_id=parent_id,
             parent_id=parent_id,
@@ -362,11 +376,7 @@ class HierarchicalChunker:
             token_count=parent_tokens,
         )
 
-        # ── Child chunks ───────────────────────────────────────────────────
-        sentences = _split_sentences(passage_text, language)
-
-        if len(sentences) <= 1 or parent_tokens <= self.child_min_tokens:
-            # Passage is already tiny — one child = the whole passage
+        if len(sentences) <= 1 and parent_tokens <= self.child_max_tokens:
             child = Chunk(
                 chunk_id=_make_chunk_id(language, query_id, passage_rank, 0),
                 parent_id=parent_id,
@@ -381,7 +391,7 @@ class HierarchicalChunker:
             )
             return parent_chunk, [child]
 
-        child_texts = self._group_sentences_into_children(sentences, language)
+        child_texts = self._group_sentences_into_children(sentences, embeddings, language)
 
         child_chunks: List[Chunk] = []
         for i, ctext in enumerate(child_texts):
@@ -403,27 +413,93 @@ class HierarchicalChunker:
 
         return parent_chunk, child_chunks
 
+    def chunk_passage(
+        self,
+        passage_text: str,
+        language: str,
+        query_id: int,
+        is_selected: int,
+        passage_rank: int,
+        query_type: str,
+    ) -> Tuple[Chunk, List[Chunk]]:
+        """
+        Chunk a single passage into one parent + N child chunks.
+        Used standalone. For bulk processing, use chunk_entry instead for better GPU utilization.
+        """
+        sentences = _split_sentences(passage_text, language)
+        parent_tokens = _estimate_tokens(passage_text, language)
+        
+        # Issue 2: Handle oversized single sentences by forcefully splitting them
+        if len(sentences) <= 1 and parent_tokens > self.child_max_tokens:
+            ratio = CHAR_TO_TOKEN.get(language, 0.35)
+            chars_per_chunk = max(1, int(self.child_max_tokens / ratio))
+            sentences = [passage_text[i:i+chars_per_chunk] for i in range(0, len(passage_text), chars_per_chunk)]
+            
+        embeddings = self._embed_sentences(sentences)
+        
+        return self._chunk_passage_with_sentences(
+            passage_text=passage_text,
+            sentences=sentences,
+            embeddings=embeddings,
+            language=language,
+            query_id=query_id,
+            is_selected=is_selected,
+            passage_rank=passage_rank,
+            query_type=query_type,
+        )
+
     def chunk_entry(self, entry) -> Tuple[List[Chunk], List[Chunk]]:
         """
-        Chunk all passages in a DatasetEntry.
+        Chunk all passages in a DatasetEntry. Batches embeddings for speed.
 
         Args:
             entry: DatasetEntry from dataset_loader.py
 
         Returns:
             (all_parents, all_children) — two separate lists.
-            Use all_children for retrieval indexing.
-            Use all_parents for context expansion after retrieval.
         """
         all_parents: List[Chunk] = []
         all_children: List[Chunk] = []
-
+        
+        passage_sentences = []
+        flat_sentences = []
+        
         for passage in entry.passages:
             if not passage.passage_text.strip():
+                passage_sentences.append([])
                 continue
-
-            parent, children = self.chunk_passage(
+                
+            sentences = _split_sentences(passage.passage_text, entry.language)
+            parent_tokens = _estimate_tokens(passage.passage_text, entry.language)
+            
+            # Issue 2: Handle oversized single sentences
+            if len(sentences) <= 1 and parent_tokens > self.child_max_tokens:
+                ratio = CHAR_TO_TOKEN.get(entry.language, 0.35)
+                chars_per_chunk = max(1, int(self.child_max_tokens / ratio))
+                text = passage.passage_text
+                sentences = [text[i:i+chars_per_chunk] for i in range(0, len(text), chars_per_chunk)]
+                
+            passage_sentences.append(sentences)
+            flat_sentences.extend(sentences)
+            
+        # Issue 6: Batch embed all sentences across all passages
+        flat_embeddings = self._embed_sentences(flat_sentences)
+        
+        emb_idx = 0
+        for p_idx, passage in enumerate(entry.passages):
+            if not passage.passage_text.strip():
+                continue
+                
+            sentences = passage_sentences[p_idx]
+            passage_embs = None
+            if flat_embeddings is not None and sentences:
+                passage_embs = flat_embeddings[emb_idx:emb_idx + len(sentences)]
+                emb_idx += len(sentences)
+                
+            parent, children = self._chunk_passage_with_sentences(
                 passage_text=passage.passage_text,
+                sentences=sentences,
+                embeddings=passage_embs,
                 language=entry.language,
                 query_id=entry.query_id,
                 is_selected=passage.is_selected,
@@ -432,5 +508,5 @@ class HierarchicalChunker:
             )
             all_parents.append(parent)
             all_children.extend(children)
-
+            
         return all_parents, all_children
