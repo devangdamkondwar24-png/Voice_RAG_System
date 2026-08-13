@@ -131,7 +131,7 @@ def _validate_row(row: dict, lang: str) -> bool:
             )
             return False
 
-        if not row.get("query", "").strip():
+        if not (row.get("query") or "").strip():
             return False
 
         return True
@@ -195,39 +195,44 @@ def load_language_dataset(
             skipped += 1
             continue
 
-        passages_raw = row["passages"]
-        is_selected_list = passages_raw["is_selected"]
-        translated_list = passages_raw["Translated_passages"]
-        # English passages may not always be present
-        english_list = passages_raw.get("English_passages", [""] * len(translated_list))
+        try:
+            passages_raw = row["passages"]
+            is_selected_list = passages_raw["is_selected"]
+            translated_list = passages_raw["Translated_passages"]
+            # English passages may not always be present
+            english_list = passages_raw.get("English_passages") or ([""] * len(translated_list))
 
-        passages = [
-            PassageEntry(
-                passage_text=translated_list[i].strip(),
-                english_text=english_list[i].strip() if i < len(english_list) else "",
-                is_selected=int(is_selected_list[i]),
-                passage_rank=i,
+            passages = [
+                PassageEntry(
+                    passage_text=translated_list[i].strip(),
+                    english_text=english_list[i].strip() if i < len(english_list) and english_list[i] else "",
+                    is_selected=int(is_selected_list[i]),
+                    passage_rank=i,
+                )
+                for i in range(len(translated_list))
+                if translated_list[i] and translated_list[i].strip()  # skip empty passages
+            ]
+
+            if not passages:
+                skipped += 1
+                continue
+
+            entry = DatasetEntry(
+                query_id=int(row.get("query_id") or 0),
+                query=(row.get("query") or "").strip(),
+                query_type=(row.get("query_type") or "DESCRIPTION").upper(),
+                gold_answer=(row.get("Answer") or "").strip(),
+                language=language,
+                source_lang=row.get("source_lang") or "eng_Latn",
+                target_lang=row.get("target_lang") or f"{language}_Unknown",
+                passages=passages,
             )
-            for i in range(len(translated_list))
-            if translated_list[i].strip()  # skip empty passages
-        ]
-
-        if not passages:
+            yield entry
+            count += 1
+        except Exception as exc:
+            logger.debug(f"[{language}] Failed to construct entry for row: {exc}")
             skipped += 1
             continue
-
-        entry = DatasetEntry(
-            query_id=int(row.get("query_id", 0)),
-            query=row["query"].strip(),
-            query_type=row.get("query_type", "DESCRIPTION").upper(),
-            gold_answer=row.get("Answer", "").strip(),
-            language=language,
-            source_lang=row.get("source_lang", "eng_Latn"),
-            target_lang=row.get("target_lang", f"{language}_Unknown"),
-            passages=passages,
-        )
-        yield entry
-        count += 1
 
     logger.info(
         f"[{language}] Loaded {count} entries, skipped {skipped} malformed rows."
@@ -243,6 +248,9 @@ def load_all_languages(
 ) -> Generator[DatasetEntry, None, None]:
     """
     Stream DatasetEntry objects for multiple languages sequentially.
+
+    TODO: If network drops midway on a 500K stream, this currently restarts from scratch
+    on the next run. Implement cursor/checkpointing based on query_id for resumability.
 
     Args:
         languages:          List of ISO 639-1 codes
