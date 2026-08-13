@@ -20,7 +20,7 @@ import time
 from typing import Dict, Any
 
 from langgraph.graph import END, START, StateGraph  # type: ignore
-from tenacity import retry, stop_after_attempt, wait_exponential
+from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
 from config.settings import get_settings
 from guardrails.abstention import get_abstention_message
@@ -163,17 +163,30 @@ class RAGOrchestrator:
 
     # ── Retries (Async Wrappers for external calls) ────────────────────────
     
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=4))
+    # Retry only on transient network/IO errors, not on semantic errors (e.g., 400 Bad Request)
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=1, max=4),
+        retry=retry_if_exception_type((ConnectionError, TimeoutError))
+    )
     async def _retrieve_with_retry(self, query: str, language: str):
         # Qdrant network call: wrap in to_thread to avoid blocking event loop
         return await asyncio.to_thread(self.retriever.search, query=query, language=language)
 
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=4))
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=1, max=4),
+        retry=retry_if_exception_type((ConnectionError, TimeoutError))
+    )
     async def _rerank_with_retry(self, query: str, retrieved_chunks: list, top_k: int):
         # Heavy GPU inference: wrap in to_thread
         return await asyncio.to_thread(self.reranker.rerank, query=query, retrieved_chunks=retrieved_chunks, top_k=top_k)
 
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=4))
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=1, max=4),
+        retry=retry_if_exception_type((ConnectionError, TimeoutError))
+    )
     async def _generate_with_retry(self, prompt: str):
         # vLLM network call
         return await self.llm_client.generate(prompt)
@@ -299,6 +312,7 @@ class RAGOrchestrator:
                 updates.update({
                     "generation_grounded": grounding["passed"],
                     "grounding_score": grounding["grounding_score"],
+                    "citations": grounding.get("citations", []),
                 })
                 
                 if not grounding["passed"]:
