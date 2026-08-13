@@ -109,6 +109,9 @@ class BGEM3Embedder:
         """
         self._load_model()
 
+        if self._model is None:
+            raise RuntimeError("Model failed to load.")
+
         try:
             output = self._model.encode(
                 [text],
@@ -151,6 +154,9 @@ class BGEM3Embedder:
               BGE-M3's max context. MSMARCO passages are well within this limit.
         """
         self._load_model()
+
+        if self._model is None:
+            raise RuntimeError("Model failed to load.")
 
         if not texts:
             return np.empty((0, 1024), dtype=np.float32), []
