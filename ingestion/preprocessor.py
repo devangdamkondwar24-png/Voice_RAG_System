@@ -561,12 +561,15 @@ class DatasetPreprocessor:
             )
             return None
 
+        gold_answer_text = self._normalize(entry.gold_answer, lang) if entry.gold_answer else ""
+        gold_answer_text, _ = self._standardize_digits(gold_answer_text)
+
         return PreprocessedEntry(
             query_id=entry.query_id,
             query=processed_query,
             raw_query=raw_query,
             query_type=entry.query_type,
-            gold_answer=self._normalize(entry.gold_answer, lang) if entry.gold_answer else "",
+            gold_answer=gold_answer_text,
             language=lang,
             source_lang=entry.source_lang,
             target_lang=entry.target_lang,
