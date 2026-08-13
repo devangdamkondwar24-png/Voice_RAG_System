@@ -1,0 +1,17 @@
+# Custom vLLM Dockerfile to pre-configure the Llama-3.1-8B-Instruct AWQ model
+FROM vllm/vllm-openai:v0.6.0
+
+# We use the official vLLM image and just set the default entrypoint args
+# to optimize for Time-To-First-Token (TTFT) and throughput on a single GPU.
+
+ENTRYPOINT ["python3", "-m", "vllm.entrypoints.openai.api_server"]
+
+# Default arguments (can be overridden in docker-compose.yml)
+CMD [ \
+    "--model", "hugging-quants/Meta-Llama-3.1-8B-Instruct-AWQ-INT4", \
+    "--quantization", "awq", \
+    "--enable-prefix-caching", \
+    "--gpu-memory-utilization", "0.85", \
+    "--max-model-len", "8192", \
+    "--tensor-parallel-size", "1" \
+]
